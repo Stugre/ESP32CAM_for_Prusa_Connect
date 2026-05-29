@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Build with Jekyll
@@ -28,7 +28,7 @@ jobs:
           source: ./docs
           destination: ./_site
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v4
 
   deploy:
     environment:
@@ -39,4 +39,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
