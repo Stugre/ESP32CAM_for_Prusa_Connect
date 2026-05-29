@@ -1,6 +1,6 @@
 # ESP32-CAM Prusa Connect
 
-This project is an ESP-IDF firmware build for an AI Thinker-style ESP32-CAM module.
+This repository contains ESP-IDF firmware for an AI Thinker-style ESP32-CAM module that connects to Wi-Fi, hosts a local configuration page, streams video, and uploads snapshots to Prusa Connect.
 
 ## What it does
 - Connects to Wi-Fi
@@ -20,6 +20,9 @@ This project is an ESP-IDF firmware build for an AI Thinker-style ESP32-CAM modu
 
 ## Repository
 Source code is available in this GitHub repository.
+
+## License
+This project is licensed under the MIT License. See [LICENSE](../LICENSE).
 
 ## Notes
 - Use the setup page on first boot to configure Wi-Fi and camera settings.

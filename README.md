@@ -1,6 +1,11 @@
 # ESP32-CAM Prusa Connect
 
-ESP-IDF firmware for an AI Thinker style ESP32-CAM. It:
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![GitHub Pages](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://stugre.github.io/ESP32CAM_for_Prusa_Connect/)
+
+ESP-IDF firmware for an AI Thinker-style ESP32-CAM module that uploads snapshots to Prusa Connect.
+
+## Features
 
 - Connects to Wi-Fi.
 - Hosts a local web page at the ESP32 IP address.
@@ -8,7 +13,10 @@ ESP-IDF firmware for an AI Thinker style ESP32-CAM. It:
 - Provides local `/jpg` snapshots and `/stream` MJPEG video.
 - Uploads snapshots to Prusa Connect with the Camera API.
 
-## Build and flash
+## Quick start
+
+1. Install ESP-IDF and activate the environment in your shell.
+2. Build and flash with:
 
 ```powershell
 idf.py set-target esp32
@@ -17,6 +25,12 @@ idf.py -p COMx flash monitor
 ```
 
 Replace `COMx` with your serial port.
+
+## GitHub Pages
+
+A simple project landing page is available in [docs/index.md](docs/index.md). If you enable GitHub Pages for the `docs/` folder, the site will be published at:
+
+https://stugre.github.io/ESP32CAM_for_Prusa_Connect/
 
 ## First boot
 
