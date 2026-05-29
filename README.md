@@ -5,6 +5,8 @@
 
 ESP-IDF firmware for an AI Thinker-style ESP32-CAM module that uploads snapshots to Prusa Connect.
 
+![ESP32-CAM Prusa Connect preview](docs/hero.svg)
+
 ## Features
 
 - Connects to Wi-Fi.
@@ -28,7 +30,9 @@ Replace `COMx` with your serial port.
 
 ## GitHub Pages
 
-A simple project landing page is available in [docs/index.md](docs/index.md). If you enable GitHub Pages for the `docs/` folder, the site will be published at:
+A simple project landing page is available in [docs/index.md](docs/index.md). The release notes are also documented in [CHANGELOG.md](CHANGELOG.md).
+
+If you enable GitHub Pages for the `docs/` folder, the site will be published at:
 
 https://stugre.github.io/ESP32CAM_for_Prusa_Connect/
 
