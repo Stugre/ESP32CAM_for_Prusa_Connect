@@ -1,0 +1,17 @@
+# ESP-IDF / build outputs
+build/
+managed_components/
+*.elf
+*.bin
+*.map
+*.hex
+*.log
+
+# Local config files
+sdkconfig
+sdkconfig.old
+
+# VS Code / OS noise
+.vscode/
+.DS_Store
+Thumbs.db
