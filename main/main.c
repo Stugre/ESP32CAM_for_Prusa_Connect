@@ -12,11 +12,13 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_psram.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "mdns.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -43,12 +45,16 @@
 #define DEFAULT_AP_SSID "ESP32CAM-Setup"
 #define DEFAULT_AP_PASS "esp32cam"
 #define DEFAULT_ENDPOINT "https://connect.prusa3d.com/c/snapshot"
+#define MDNS_HOSTNAME "esp32cam"
 
 static const char *TAG = "esp32cam-prusa";
 static EventGroupHandle_t wifi_events;
 static httpd_handle_t server;
 static char ip_text[16] = "192.168.4.1";
 static bool wifi_configured;
+static char page_notice[192];
+static char last_upload_summary[192] = "No upload attempted yet.";
+static int64_t last_upload_ms;
 
 typedef struct {
     char wifi_ssid[33];
@@ -141,6 +147,35 @@ static esp_err_t settings_save(void)
     }
     nvs_close(nvs);
     return err;
+}
+
+static esp_err_t settings_reset_saved(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_erase_key(nvs, "app");
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+static void delayed_restart_task(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(700));
+    esp_restart();
+}
+
+static void schedule_restart(void)
+{
+    xTaskCreate(delayed_restart_task, "restart", 2048, NULL, 5, NULL);
 }
 
 static const char *framesize_name(framesize_t size)
@@ -282,6 +317,19 @@ static void wifi_start(void)
     ESP_LOGI(TAG, "Setup AP: http://192.168.4.1");
 }
 
+static void mdns_start(void)
+{
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mDNS init failed: %s", esp_err_to_name(err));
+        return;
+    }
+    mdns_hostname_set(MDNS_HOSTNAME);
+    mdns_instance_name_set("ESP32-CAM Prusa Connect");
+    mdns_service_add("ESP32-CAM Web", "_http", "_tcp", 80, NULL, 0);
+    ESP_LOGI(TAG, "mDNS: http://%s.local", MDNS_HOSTNAME);
+}
+
 static void html_escape(char *out, size_t out_len, const char *in)
 {
     size_t pos = 0;
@@ -305,13 +353,31 @@ static void send_chunk(httpd_req_t *req, const char *fmt, ...)
     httpd_resp_sendstr_chunk(req, chunk);
 }
 
+static void upload_status_set(esp_err_t err, int http_status, size_t bytes, const char *source)
+{
+    last_upload_ms = esp_timer_get_time() / 1000;
+    if (err == ESP_OK && (http_status == 200 || http_status == 204)) {
+        snprintf(last_upload_summary, sizeof(last_upload_summary),
+                 "%s upload OK. HTTP %d, %u bytes sent.", source, http_status, (unsigned)bytes);
+    } else if (err == ESP_ERR_INVALID_STATE) {
+        snprintf(last_upload_summary, sizeof(last_upload_summary),
+                 "%s upload skipped: Prusa token or fingerprint is missing.", source);
+    } else if (http_status > 0) {
+        snprintf(last_upload_summary, sizeof(last_upload_summary),
+                 "%s upload failed. HTTP %d, error %s.", source, http_status, esp_err_to_name(err));
+    } else {
+        snprintf(last_upload_summary, sizeof(last_upload_summary),
+                 "%s upload failed: %s.", source, esp_err_to_name(err));
+    }
+}
+
 static void send_select(httpd_req_t *req, const char *name, int current)
 {
     const framesize_t sizes[] = {
         FRAMESIZE_QQVGA, FRAMESIZE_QVGA, FRAMESIZE_VGA, FRAMESIZE_SVGA,
         FRAMESIZE_XGA, FRAMESIZE_SXGA, FRAMESIZE_UXGA
     };
-    send_chunk(req, "<label>Resolution<select name=\"%s\">", name);
+    send_chunk(req, "<label><span class=\"label-row\">Resolution <span class=\"info\" title=\"Photo size. Smaller values like QQVGA are fast and light; larger values like UXGA give more detail but upload slower and use more memory.\">i</span></span><select name=\"%s\">", name);
     for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
         send_chunk(req, "<option value=\"%d\"%s>%s</option>", sizes[i],
                    current == sizes[i] ? " selected" : "", framesize_name(sizes[i]));
@@ -321,27 +387,47 @@ static void send_select(httpd_req_t *req, const char *name, int current)
 
 static esp_err_t index_handler(httpd_req_t *req)
 {
-    char ssid[80], token[140], fingerprint[140], endpoint[220];
+    char ssid[80], token[140], fingerprint[140], endpoint[220], notice[260], upload_summary[260];
     html_escape(ssid, sizeof(ssid), settings.wifi_ssid);
     html_escape(token, sizeof(token), settings.prusa_token);
     html_escape(fingerprint, sizeof(fingerprint), settings.prusa_fingerprint);
     html_escape(endpoint, sizeof(endpoint), settings.prusa_endpoint);
+    html_escape(notice, sizeof(notice), page_notice);
+    html_escape(upload_summary, sizeof(upload_summary), last_upload_summary);
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr_chunk(req,
         "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<title>ESP32-CAM Prusa Connect</title><style>"
         "body{font-family:system-ui,Segoe UI,sans-serif;margin:0;background:#f6f7f9;color:#17202a}"
-        "main{max-width:1040px;margin:auto;padding:20px}.top{display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap}"
+        "main{max-width:1040px;margin:auto;padding:20px}.top{display:flex;gap:16px;align-items:flex-end;justify-content:space-between;flex-wrap:wrap}"
         "h1{font-size:24px;margin:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:16px}"
         "section{background:white;border:1px solid #d8dee8;border-radius:8px;padding:16px}label{display:grid;gap:6px;margin:10px 0;font-size:14px}"
+        ".label-row{display:flex;align-items:center;gap:6px}.info{display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;background:#e7edf5;color:#2d4b66;font-size:11px;font-weight:700;cursor:help}"
         "input,select{font:inherit;padding:9px;border:1px solid #b8c0cc;border-radius:6px;box-sizing:border-box;width:100%}"
         "button,a.btn{font:inherit;display:inline-block;padding:10px 13px;border:0;border-radius:6px;background:#d94b2b;color:white;text-decoration:none;cursor:pointer}"
-        ".row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.preview{width:100%;background:#222;border-radius:8px}small{color:#596779}"
+        "a.secondary{background:#596779}a.danger{background:#9b2f2f}"
+        ".status{margin-top:16px;padding:10px 12px;border:1px solid #c8d3e1;border-radius:8px;background:#fff;color:#24364a}"
+        ".notice{margin-top:16px;padding:10px 12px;border:1px solid #e2c45f;border-radius:8px;background:#fff7d6;color:#4d3a00}"
+        ".top-actions{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px}"
+        "a.snapshot{background:#2f6f8f}a.stream{background:#28785f}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}"
+        ".wide{grid-column:1/-1}"
+        ".sensor-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 10px}.sensor-grid label{margin:8px 0}"
+        ".preview{width:100%;margin-top:16px;background:#222;border-radius:8px}small{color:#596779}@media(max-width:760px){.sensor-grid,.row{grid-template-columns:1fr}}"
         "</style></head><body><main><div class=\"top\"><div><h1>ESP32-CAM Prusa Connect</h1>");
-    send_chunk(req, "<small>Device IP: %s</small></div><div><a class=\"btn\" href=\"/jpg\">Snapshot</a> <a class=\"btn\" href=\"/stream\">Stream</a></div></div>", ip_text);
-    httpd_resp_sendstr_chunk(req, "<img class=\"preview\" src=\"/jpg\" alt=\"camera preview\"><form method=\"post\" action=\"/save\"><div class=\"grid\"><section><h2>Network</h2>");
-    send_chunk(req, "<label>Wi-Fi SSID<input name=\"wifi_ssid\" list=\"wifi_networks\" maxlength=\"32\" value=\"%s\"></label><datalist id=\"wifi_networks\">", ssid);
+    send_chunk(req, "<small>Device IP: %s | mDNS: http://%s.local</small><form method=\"post\" action=\"/save\"><div class=\"actions\"><button type=\"submit\">Save settings</button> <a class=\"btn\" href=\"/send\">Test upload now</a> <a class=\"btn secondary\" href=\"/reboot\">Reboot</a> <a class=\"btn danger\" href=\"/reset\" onclick=\"return confirm('Clear all saved settings and reboot?')\">Factory reset</a></div></div><div class=\"top-actions\"><a class=\"btn snapshot\" href=\"/jpg\">Snapshot</a> <a class=\"btn stream\" href=\"/stream\">Stream</a></div></div>", ip_text, MDNS_HOSTNAME);
+    if (page_notice[0]) {
+        send_chunk(req, "<div class=\"notice\">%s</div>", notice);
+        page_notice[0] = '\0';
+    }
+    int64_t age_s = last_upload_ms ? ((esp_timer_get_time() / 1000) - last_upload_ms) / 1000 : -1;
+    if (age_s >= 0) {
+        send_chunk(req, "<div class=\"status\">Last upload: %s (%lld seconds ago)</div>", upload_summary, age_s);
+    } else {
+        send_chunk(req, "<div class=\"status\">Last upload: %s</div>", upload_summary);
+    }
+    httpd_resp_sendstr_chunk(req, "<img class=\"preview\" src=\"/jpg\" alt=\"camera preview\"><div class=\"grid\"><section><h2>Network</h2>");
+    send_chunk(req, "<label><span class=\"label-row\">Wi-Fi SSID <span class=\"info\" title=\"The name of the Wi-Fi network the camera should join. Pick a scanned network or type a hidden network name manually.\">i</span></span><input name=\"wifi_ssid\" list=\"wifi_networks\" maxlength=\"32\" value=\"%s\"></label><datalist id=\"wifi_networks\">", ssid);
 
     wifi_ap_record_t aps[20] = {0};
     uint16_t ap_count = 20;
@@ -355,42 +441,42 @@ static esp_err_t index_handler(httpd_req_t *req)
                        aps[i].authmode == WIFI_AUTH_OPEN ? " open" : "");
         }
     }
-    httpd_resp_sendstr_chunk(req, "</datalist><label>Wi-Fi password<input name=\"wifi_pass\" type=\"password\" maxlength=\"64\" placeholder=\"Blank for open Wi-Fi\"></label></section><section><h2>Prusa Connect</h2>");
-    send_chunk(req, "<label>Token<input name=\"prusa_token\" maxlength=\"95\" value=\"%s\"></label>", token);
-    send_chunk(req, "<label>Fingerprint<input name=\"prusa_fingerprint\" maxlength=\"95\" value=\"%s\"></label>", fingerprint);
-    send_chunk(req, "<label>Endpoint<input name=\"prusa_endpoint\" maxlength=\"159\" value=\"%s\"></label>", endpoint);
-    send_chunk(req, "<label>Upload interval seconds<input name=\"upload_interval_s\" type=\"number\" min=\"10\" max=\"3600\" value=\"%lu\"></label></section>", (unsigned long)settings.upload_interval_s);
+    httpd_resp_sendstr_chunk(req, "</datalist><label><span class=\"label-row\">Wi-Fi password <span class=\"info\" title=\"The Wi-Fi password. Leave blank for open networks; saving blank clears any stored password.\">i</span></span><input name=\"wifi_pass\" type=\"password\" maxlength=\"64\" placeholder=\"Blank for open Wi-Fi\"></label></section><section><h2>Prusa Connect</h2>");
+    send_chunk(req, "<label><span class=\"label-row\">Token <span class=\"info\" title=\"The camera token from Prusa Connect. It authorizes this ESP32-CAM to upload snapshots to your Prusa Connect camera.\">i</span></span><input name=\"prusa_token\" type=\"password\" maxlength=\"95\" value=\"%s\"></label>", token);
+    send_chunk(req, "<label><span class=\"label-row\">Fingerprint <span class=\"info\" title=\"The camera fingerprint from Prusa Connect. It identifies this camera alongside the token.\">i</span></span><input name=\"prusa_fingerprint\" type=\"password\" maxlength=\"95\" value=\"%s\"></label>", fingerprint);
+    send_chunk(req, "<label><span class=\"label-row\">Endpoint <span class=\"info\" title=\"The Prusa Connect camera upload URL. The default is normally correct unless Prusa changes the API or you use a proxy.\">i</span></span><input name=\"prusa_endpoint\" maxlength=\"159\" value=\"%s\"></label>", endpoint);
+    send_chunk(req, "<label><span class=\"label-row\">Upload interval seconds <span class=\"info\" title=\"How often the ESP32-CAM sends a snapshot to Prusa Connect. Shorter intervals feel more live but use more bandwidth and power.\">i</span></span><input name=\"upload_interval_s\" type=\"number\" min=\"10\" max=\"3600\" value=\"%lu\"></label></section>", (unsigned long)settings.upload_interval_s);
     httpd_resp_sendstr_chunk(req, "<section><h2>Image</h2>");
     send_select(req, "framesize", settings.framesize);
-    send_chunk(req, "<label>JPEG quality 4-63<input name=\"jpeg_quality\" type=\"number\" min=\"4\" max=\"63\" value=\"%u\"></label>", settings.jpeg_quality);
-    send_chunk(req, "<div class=\"row\"><label>Brightness<input name=\"brightness\" type=\"number\" min=\"-2\" max=\"2\" value=\"%d\"></label>", settings.brightness);
-    send_chunk(req, "<label>Contrast<input name=\"contrast\" type=\"number\" min=\"-2\" max=\"2\" value=\"%d\"></label></div>", settings.contrast);
-    send_chunk(req, "<div class=\"row\"><label>Saturation<input name=\"saturation\" type=\"number\" min=\"-2\" max=\"2\" value=\"%d\"></label>", settings.saturation);
-    send_chunk(req, "<label>Effect<input name=\"special_effect\" type=\"number\" min=\"0\" max=\"6\" value=\"%u\"></label></div></section>", settings.special_effect);
-    httpd_resp_sendstr_chunk(req, "<section><h2>Sensor</h2>");
-#define FIELD_U(name, label, min, max) send_chunk(req, "<label>" label "<input name=\"" #name "\" type=\"number\" min=\"" #min "\" max=\"" #max "\" value=\"%u\"></label>", settings.name)
-#define FIELD_I(name, label, min, max) send_chunk(req, "<label>" label "<input name=\"" #name "\" type=\"number\" min=\"" #min "\" max=\"" #max "\" value=\"%d\"></label>", settings.name)
-    FIELD_U(hmirror, "Horizontal mirror", 0, 1);
-    FIELD_U(vflip, "Vertical flip", 0, 1);
-    FIELD_U(awb, "Auto white balance", 0, 1);
-    FIELD_U(awb_gain, "AWB gain", 0, 1);
-    FIELD_U(wb_mode, "WB mode", 0, 4);
-    FIELD_U(aec, "Auto exposure", 0, 1);
-    FIELD_U(aec2, "AEC DSP", 0, 1);
-    FIELD_I(ae_level, "AE level", -2, 2);
-    FIELD_U(aec_value, "AEC value", 0, 1200);
-    FIELD_U(agc, "Auto gain", 0, 1);
-    FIELD_U(agc_gain, "AGC gain", 0, 30);
-    FIELD_U(gainceiling, "Gain ceiling", 0, 6);
-    FIELD_U(bpc, "Black pixel correction", 0, 1);
-    FIELD_U(wpc, "White pixel correction", 0, 1);
-    FIELD_U(raw_gma, "Gamma correction", 0, 1);
-    FIELD_U(lenc, "Lens correction", 0, 1);
-    FIELD_U(dcw, "Downsize enable", 0, 1);
-    FIELD_U(colorbar, "Color bar test", 0, 1);
+    send_chunk(req, "<label><span class=\"label-row\">JPEG quality 4-63 <span class=\"info\" title=\"JPG compression. 4 is highest quality and largest file; 10-15 is a good balance; 63 is smallest file and lowest quality.\">i</span></span><input name=\"jpeg_quality\" type=\"number\" min=\"4\" max=\"63\" value=\"%u\"></label>", settings.jpeg_quality);
+    send_chunk(req, "<div class=\"row\"><label><span class=\"label-row\">Brightness <span class=\"info\" title=\"Overall lightness. -2 is darkest; 0 is normal; 2 is brightest.\">i</span></span><input name=\"brightness\" type=\"number\" min=\"-2\" max=\"2\" value=\"%d\"></label>", settings.brightness);
+    send_chunk(req, "<label><span class=\"label-row\">Contrast <span class=\"info\" title=\"Dark-to-light separation. -2 is flatter and softer; 0 is normal; 2 is punchier but can lose detail.\">i</span></span><input name=\"contrast\" type=\"number\" min=\"-2\" max=\"2\" value=\"%d\"></label></div>", settings.contrast);
+    send_chunk(req, "<div class=\"row\"><label><span class=\"label-row\">Saturation <span class=\"info\" title=\"Color strength. -2 is muted; 0 is normal; 2 is very colorful and can look unnatural.\">i</span></span><input name=\"saturation\" type=\"number\" min=\"-2\" max=\"2\" value=\"%d\"></label>", settings.saturation);
+    send_chunk(req, "<label><span class=\"label-row\">Effect <span class=\"info\" title=\"Built-in effect. 0 normal; 1 negative; 2 black and white; 3 reddish; 4 greenish; 5 blue; 6 retro.\">i</span></span><input name=\"special_effect\" type=\"number\" min=\"0\" max=\"6\" value=\"%u\"></label></div></section>", settings.special_effect);
+    httpd_resp_sendstr_chunk(req, "<section class=\"wide\"><h2>Sensor</h2><div class=\"sensor-grid\">");
+#define FIELD_U(name, label, min, max, help) send_chunk(req, "<label><span class=\"label-row\">" label " <span class=\"info\" title=\"" help "\">i</span></span><input name=\"" #name "\" type=\"number\" min=\"" #min "\" max=\"" #max "\" value=\"%u\"></label>", settings.name)
+#define FIELD_I(name, label, min, max, help) send_chunk(req, "<label><span class=\"label-row\">" label " <span class=\"info\" title=\"" help "\">i</span></span><input name=\"" #name "\" type=\"number\" min=\"" #min "\" max=\"" #max "\" value=\"%d\"></label>", settings.name)
+    FIELD_U(hmirror, "Horizontal mirror", 0, 1, "0 off; 1 on. Flips the image left-to-right.");
+    FIELD_U(vflip, "Vertical flip", 0, 1, "0 off; 1 on. Flips the image upside down.");
+    FIELD_U(awb, "Auto white balance", 0, 1, "0 manual color balance; 1 automatic color balance. Usually leave on.");
+    FIELD_U(awb_gain, "AWB gain", 0, 1, "0 fixed white-balance gain; 1 lets auto white balance adjust red and blue gain. Usually leave on with AWB.");
+    FIELD_U(wb_mode, "WB mode", 0, 4, "White balance preset when manual color is used. 0 auto/default; 1 sunny; 2 cloudy; 3 office; 4 home.");
+    FIELD_U(aec, "Auto exposure", 0, 1, "0 manual exposure using AEC value; 1 automatic exposure. Usually leave on unless lighting is fixed.");
+    FIELD_U(aec2, "AEC DSP", 0, 1, "0 off; 1 on. Extra digital auto-exposure processing; try toggling if exposure pulses or looks wrong.");
+    FIELD_I(ae_level, "AE level", -2, 2, "Auto-exposure brightness bias. -2 darker; 0 normal; 2 brighter.");
+    FIELD_U(aec_value, "AEC value", 0, 1200, "Manual exposure when Auto exposure is 0. 0 darkest/fastest; 1200 brightest/slowest and may blur.");
+    FIELD_U(agc, "Auto gain", 0, 1, "0 manual gain using AGC gain; 1 automatic gain. Gain brightens dark scenes but adds speckled noise.");
+    FIELD_U(agc_gain, "AGC gain", 0, 30, "Manual gain when Auto gain is 0. 0 lowest gain and least noise; 30 brightest and most noise.");
+    FIELD_U(gainceiling, "Gain ceiling", 0, 6, "Maximum auto gain. 0=2x least noise; 1=4x; 2=8x; 3=16x; 4=32x; 5=64x; 6=128x brightest/noisiest.");
+    FIELD_U(bpc, "Black pixel correction", 0, 1, "0 off; 1 on. Fixes stuck dark pixels.");
+    FIELD_U(wpc, "White pixel correction", 0, 1, "0 off; 1 on. Fixes stuck bright pixels.");
+    FIELD_U(raw_gma, "Gamma correction", 0, 1, "0 off; 1 on. Brightens/darkens mid-tones for a more natural image.");
+    FIELD_U(lenc, "Lens correction", 0, 1, "0 off; 1 on. Helps compensate for darker corners from the small lens.");
+    FIELD_U(dcw, "Downsize enable", 0, 1, "0 off; 1 on. Uses sensor downsampling at smaller resolutions; usually leave on for cleaner resized images.");
+    FIELD_U(colorbar, "Color bar test", 0, 1, "0 normal camera image; 1 color test pattern for checking the sensor.");
 #undef FIELD_U
 #undef FIELD_I
-    httpd_resp_sendstr_chunk(req, "</section></div><p><button type=\"submit\">Save settings</button> <a class=\"btn\" href=\"/send\">Send snapshot now</a></p></form></main></body></html>");
+    httpd_resp_sendstr_chunk(req, "</div></section></div></form></main></body></html>");
     httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
 }
@@ -519,14 +605,16 @@ static esp_err_t jpg_handler(httpd_req_t *req)
     return err;
 }
 
-static esp_err_t upload_snapshot(void)
+static esp_err_t upload_snapshot(const char *source)
 {
     if (!settings.prusa_token[0] || !settings.prusa_fingerprint[0]) {
+        upload_status_set(ESP_ERR_INVALID_STATE, 0, 0, source);
         return ESP_ERR_INVALID_STATE;
     }
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
+        upload_status_set(ESP_FAIL, 0, 0, source);
         return ESP_FAIL;
     }
 
@@ -544,6 +632,7 @@ static esp_err_t upload_snapshot(void)
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);
     ESP_LOGI(TAG, "Prusa snapshot upload: err=%s status=%d bytes=%u", esp_err_to_name(err), status, (unsigned)fb->len);
+    upload_status_set(err, status, fb->len, source);
     esp_http_client_cleanup(client);
     esp_camera_fb_return(fb);
     return (err == ESP_OK && (status == 200 || status == 204)) ? ESP_OK : ESP_FAIL;
@@ -551,12 +640,32 @@ static esp_err_t upload_snapshot(void)
 
 static esp_err_t send_now_handler(httpd_req_t *req)
 {
-    esp_err_t err = upload_snapshot();
-    httpd_resp_set_status(req, err == ESP_OK ? "303 See Other" : "500 Upload Failed");
+    esp_err_t err = upload_snapshot("Manual test");
+    snprintf(page_notice, sizeof(page_notice), "%s", err == ESP_OK ? "Test upload completed." : "Test upload failed. See the upload status line below.");
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_sendstr(req, "Test complete");
+    return ESP_OK;
+}
+
+static esp_err_t reboot_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req, "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"refresh\" content=\"8;url=/\"><title>Rebooting</title></head><body><h1>Rebooting ESP32-CAM</h1><p>Reconnect to the camera in a few seconds.</p></body></html>");
+    schedule_restart();
+    return ESP_OK;
+}
+
+static esp_err_t reset_handler(httpd_req_t *req)
+{
+    esp_err_t err = settings_reset_saved();
+    httpd_resp_set_type(req, "text/html");
     if (err == ESP_OK) {
-        httpd_resp_set_hdr(req, "Location", "/");
+        httpd_resp_sendstr(req, "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"refresh\" content=\"10;url=http://192.168.4.1/\"><title>Factory reset</title></head><body><h1>Settings cleared</h1><p>The ESP32-CAM is rebooting. Join Wi-Fi network ESP32CAM-Setup, then open http://192.168.4.1/.</p></body></html>");
+        schedule_restart();
+    } else {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not clear settings");
     }
-    httpd_resp_sendstr(req, err == ESP_OK ? "Sent" : "Upload failed. Check token, fingerprint, endpoint, and serial log.");
     return ESP_OK;
 }
 
@@ -594,11 +703,15 @@ static void web_start(void)
     httpd_uri_t jpg = {.uri = "/jpg", .method = HTTP_GET, .handler = jpg_handler};
     httpd_uri_t stream = {.uri = "/stream", .method = HTTP_GET, .handler = stream_handler};
     httpd_uri_t send = {.uri = "/send", .method = HTTP_GET, .handler = send_now_handler};
+    httpd_uri_t reboot = {.uri = "/reboot", .method = HTTP_GET, .handler = reboot_handler};
+    httpd_uri_t reset = {.uri = "/reset", .method = HTTP_GET, .handler = reset_handler};
     httpd_register_uri_handler(server, &index);
     httpd_register_uri_handler(server, &save);
     httpd_register_uri_handler(server, &jpg);
     httpd_register_uri_handler(server, &stream);
     httpd_register_uri_handler(server, &send);
+    httpd_register_uri_handler(server, &reboot);
+    httpd_register_uri_handler(server, &reset);
 }
 
 static void uploader_task(void *arg)
@@ -607,7 +720,7 @@ static void uploader_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(settings.upload_interval_s * 1000));
         EventBits_t bits = xEventGroupGetBits(wifi_events);
         if ((bits & WIFI_CONNECTED_BIT) && settings.prusa_token[0] && settings.prusa_fingerprint[0]) {
-            upload_snapshot();
+            upload_snapshot("Automatic");
         }
     }
 }
@@ -623,6 +736,7 @@ void app_main(void)
     settings_load();
     ESP_ERROR_CHECK(camera_init());
     wifi_start();
+    mdns_start();
     web_start();
     xTaskCreate(uploader_task, "prusa_uploader", 8192, NULL, 5, NULL);
 }
